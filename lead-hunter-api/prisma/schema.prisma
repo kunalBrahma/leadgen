@@ -1,0 +1,51 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  password  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Lead {
+  id             String           @id @default(uuid())
+  platform       String
+  platformPostId String           @unique
+  authorHandle   String
+  content        String
+  url            String
+  intentScore    Int?
+  founderScore   Int?
+  analysis       String?
+  isBuyer        Boolean?         @default(false)
+  searchContext  String?
+  postedAt       DateTime?
+  status         String           @default("detected")
+  createdAt      DateTime         @default(now())
+  generatedReply GeneratedReply[]
+}
+
+model IntentConfig {
+  id             String  @id @default(uuid())
+  targetPersona  String
+  activeKeywords Json
+  isActive       Boolean @default(true)
+}
+
+model GeneratedReply {
+  id               String   @id @default(uuid())
+  leadId           String
+  suggestedText    String
+  replyStyle       String
+  usedInProduction Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  lead             Lead     @relation(fields: [leadId], references: [id])
+}
