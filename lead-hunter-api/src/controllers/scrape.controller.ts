@@ -4,12 +4,23 @@ import path from 'path';
 
 export const triggerManualScrape = (req: Request, res: Response) => {
     const pythonExecutable = path.join(process.cwd(), 'venv', 'bin', 'python');
-    const scriptPath = path.join(process.cwd(), 'x_worker.py');
+    const { queries, mode = 'keyword', platform = 'X' } = req.body;
 
-    const { queries } = req.body;
+    // Validate mode
+    const validModes = ['keyword', 'trigger', 'authority'];
+    const scrapeMode = validModes.includes(mode) ? mode : 'keyword';
 
-    // Build the argument list from the queries array
-    const args: string[] = [scriptPath];
+    let args: string[] = [];
+    if (platform === 'LinkedIn') {
+        const scriptPath = path.join(process.cwd(), 'linkedin_worker.py');
+        args = [scriptPath];
+    } else if (platform === 'Reddit') {
+        const scriptPath = path.join(process.cwd(), 'reddit_worker.py');
+        args = [scriptPath];
+    } else {
+        const scriptPath = path.join(process.cwd(), 'x_worker.py');
+        args = [scriptPath, '--mode', scrapeMode];
+    }
 
     if (Array.isArray(queries) && queries.length > 0) {
         const cleanedQueries = queries
@@ -18,12 +29,12 @@ export const triggerManualScrape = (req: Request, res: Response) => {
 
         if (cleanedQueries.length > 0) {
             args.push(...cleanedQueries);
-            console.log(`🚀 Manual scrape triggered with ${cleanedQueries.length} queries: ${cleanedQueries}`);
+            console.log(`🚀 Manual scrape triggered on ${platform} with ${cleanedQueries.length} queries: ${cleanedQueries}`);
         } else {
-            console.log("🚀 Manual scrape triggered using database keywords...");
+            console.log(`🚀 Manual scrape triggered on ${platform} using database keywords...`);
         }
     } else {
-        console.log("🚀 Manual scrape triggered using database keywords...");
+        console.log(`🚀 Manual scrape triggered on ${platform} using database keywords...`);
     }
 
     // Use spawn instead of exec for better performance with long-running processes

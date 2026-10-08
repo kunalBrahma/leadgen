@@ -6,6 +6,7 @@ import {
   IconSettings,
   IconTargetArrow,
 } from "@tabler/icons-react"
+import Link from "next/link"
 
 import { NavMain } from "@/components/nav-main"
 import {
@@ -42,10 +43,10 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
               asChild
               className="data-[slot=sidebar-menu-button]:p-1.5!"
             >
-              <a href="/dashboard">
+              <Link href="/dashboard">
                 <IconTargetArrow className="size-5!" />
                 <span className="text-base font-semibold">Lead Hunter</span>
-              </a>
+              </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>

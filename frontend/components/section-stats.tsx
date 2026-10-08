@@ -20,14 +20,16 @@ interface Stats {
     total: number
     hotLeads: number
     avgIntent: number
+    buyerCount: number
 }
 
 export function SectionStats() {
-    const [stats, setStats] = React.useState<Stats>({ total: 0, hotLeads: 0, avgIntent: 0 })
+    const [stats, setStats] = React.useState<Stats>({ total: 0, hotLeads: 0, avgIntent: 0, buyerCount: 0 })
     const [isScraping, setIsScraping] = React.useState(false)
     const [queryInput, setQueryInput] = React.useState("")
     const [queries, setQueries] = React.useState<string[]>([])
     const [isDeleting, setIsDeleting] = React.useState(false)
+    const [platform, setPlatform] = React.useState<"X" | "LinkedIn" | "Reddit">("X")
 
     const fetchStats = React.useCallback(async () => {
         try {
@@ -37,7 +39,8 @@ export function SectionStats() {
                 setStats({
                     total: data.data.total || 0,
                     hotLeads: data.data.hotLeads || 0,
-                    avgIntent: data.data.avgIntent || 0
+                    avgIntent: data.data.avgIntent || 0,
+                    buyerCount: data.data.buyerCount || 0
                 })
             }
         } catch (err) {
@@ -125,16 +128,31 @@ export function SectionStats() {
             await fetch(`${API_URL}/api/scrape`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ queries }),
+                body: JSON.stringify({ queries, platform }),
             });
 
-            // Wait 30 seconds for the scraper to finish a cycle
+            // Poll the backend for new stats every 5s to detect when scraping finishes
+            const pollInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API_URL}/api/leads/stats`)
+                    const data = await res.json()
+                    if (data.success && data.data && data.data.total > stats.total) {
+                        clearInterval(pollInterval)
+                        setIsScraping(false)
+                        toast.success("New leads detected! Scrape cycle finished.")
+                        fetchStats()
+                        window.location.reload()
+                    }
+                } catch { /* ignore polling errors */ }
+            }, 5000)
+
+            // Safety timeout: stop polling after 2 minutes
             setTimeout(() => {
-                setIsScraping(false);
-                toast.success("Scrape cycle finished!");
-                fetchStats();
-                window.location.reload(); // Sync feed below
-            }, 30000);
+                clearInterval(pollInterval)
+                setIsScraping(false)
+                toast.info("Scrape timeout reached. Check backend logs.")
+                fetchStats()
+            }, 120000)
 
         } catch (error) {
             console.error("Failed to trigger scraper", error);
@@ -169,7 +187,7 @@ export function SectionStats() {
                 {/* Input Row */}
                 <div className="flex items-center gap-2">
                     <Input
-                        placeholder="e.g. 'need a nodejs dev', 'startup mvp'..."
+                        placeholder="e.g. 'need a website', 'website redesign', 'looking for web designer'..."
                         className="h-9 flex-1 text-xs bg-background border-border/50 focus:border-blue-500/50"
                         value={queryInput}
                         onChange={(e) => setQueryInput(e.target.value)}
@@ -210,28 +228,41 @@ export function SectionStats() {
                     </div>
                 )}
 
-                {/* Scrape Button */}
-                <Button
-                    onClick={handleManualScrape}
-                    disabled={isScraping || queries.length === 0}
-                    variant={isScraping ? "secondary" : "default"}
-                    className={`w-full gap-2 ${!isScraping && queries.length > 0 ? "bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-900/20" : ""}`}
-                >
-                    {isScraping ? (
-                        <>
-                            <span className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                            Scraping Active...
-                        </>
-                    ) : (
-                        <>
-                            <IconBolt className="size-4 fill-current" />
-                            Force Scrape Now ({queries.length} {queries.length === 1 ? 'query' : 'queries'})
-                        </>
-                    )}
-                </Button>
+                {/* Scrape Button Row */}
+                <div className="flex items-center gap-2">
+                    <select
+                        className="h-10 rounded-md border border-border/50 bg-background px-3 text-sm focus:border-blue-500/50 focus:outline-none"
+                        value={platform}
+                        onChange={(e) => setPlatform(e.target.value as "X" | "LinkedIn" | "Reddit")}
+                        disabled={isScraping}
+                    >
+                        <option value="X">X (Twitter)</option>
+                        <option value="LinkedIn">LinkedIn</option>
+                        <option value="Reddit">Reddit</option>
+                    </select>
+
+                    <Button
+                        onClick={handleManualScrape}
+                        disabled={isScraping || queries.length === 0}
+                        variant={isScraping ? "secondary" : "default"}
+                        className={`flex-1 gap-2 ${!isScraping && queries.length > 0 ? "bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-900/20" : ""}`}
+                    >
+                        {isScraping ? (
+                            <>
+                                <span className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                                Scraping Active...
+                            </>
+                        ) : (
+                            <>
+                                <IconBolt className="size-4 fill-current" />
+                                Force Scrape {platform} ({queries.length} {queries.length === 1 ? 'query' : 'queries'})
+                            </>
+                        )}
+                    </Button>
+                </div>
             </div>
 
-            <div className="grid grid-cols-1 gap-4 @xl/main:grid-cols-3">
+            <div className="grid grid-cols-1 gap-4 @xl/main:grid-cols-2 @3xl/main:grid-cols-4">
                 <Card className="@container/card bg-gradient-to-t from-primary/5 to-card shadow-xs">
                     <CardHeader>
                         <CardDescription>Total Leads Detected</CardDescription>
@@ -273,6 +304,21 @@ export function SectionStats() {
                         <div className="flex gap-2 font-medium text-amber-400/70">
                             <IconTrendingUp className="size-4" />
                             Lead quality indicator
+                        </div>
+                    </CardFooter>
+                </Card>
+
+                <Card className="@container/card bg-gradient-to-t from-blue-500/5 to-card shadow-xs">
+                    <CardHeader>
+                        <CardDescription>Verified Buyers</CardDescription>
+                        <CardTitle className="text-2xl font-semibold tabular-nums text-blue-400 @[250px]/card:text-3xl">
+                            {stats.buyerCount}
+                        </CardTitle>
+                    </CardHeader>
+                    <CardFooter className="flex-col items-start gap-1.5 text-sm">
+                        <div className="flex gap-2 font-medium text-blue-400/70">
+                            <IconFlame className="size-4" />
+                            AI-qualified prospects
                         </div>
                     </CardFooter>
                 </Card>

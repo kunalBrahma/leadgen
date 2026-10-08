@@ -1,182 +1,272 @@
 import { Redis } from "ioredis";
 import OpenAI from "openai";
+import { z } from "zod";
+import { zodResponseFormat } from "openai/helpers/zod";
 import prisma from "../config/prisma";
 import "dotenv/config";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6380");
 const QUEUE_NAME = "raw_leads";
+const MAX_RETRIES = 3;
+const RETRY_KEY_PREFIX = "lead_retry_count:";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function getPostAge(postedAt: string | null): string {
-    if (!postedAt) return "unknown (assume recent)";
-    const posted = new Date(postedAt);
-    const now = new Date();
-    const diffMs = now.getTime() - posted.getTime();
-    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-    const diffDays = Math.floor(diffHours / 24);
+// ─── Fix #1: Zod Schema for Structured Outputs ─────────────────────────────
+// Guarantees 100% type-safe JSON from OpenAI. No hallucinated keys.
+const SDRGradingSchema = z.object({
+    total_score: z.number().int().min(1).max(10)
+        .describe("Overall lead qualification score from 1-10"),
+    buying_power_score: z.number().int().min(0).max(4)
+        .describe("0-4: Can they afford premium services?"),
+    pain_awareness_score: z.number().int().min(0).max(3)
+        .describe("0-3: Are they explicitly stating a business problem?"),
+    actionability_score: z.number().int().min(0).max(3)
+        .describe("0-3: Are they ready to act and hire NOW?"),
+    qualification_reason: z.string()
+        .describe("1 concise sentence explaining the score rationale"),
+    suggested_icebreaker: z.string()
+        .describe("Highly personalized, conversational DM opener. Do NOT pitch. Ask about their bottleneck. Make it 2-3 sentences."),
+});
 
-    if (diffHours < 1) return "less than 1 hour ago (very fresh)";
-    if (diffHours < 6) return `${diffHours} hours ago (fresh)`;
-    if (diffHours < 24) return `${diffHours} hours ago (today)`;
-    if (diffDays < 3) return `${diffDays} days ago (recent)`;
-    if (diffDays < 7) return `${diffDays} days ago (getting stale)`;
-    return `${diffDays} days ago (stale — they likely found a solution already)`;
-}
+type SDRGrading = z.infer<typeof SDRGradingSchema>;
 
-const getSystemPrompt = (targetContext: string) => `
-You are an elite lead qualification analyst. You analyze social media posts found by searching for "${targetContext}".
+const SYSTEM_PROMPT = `
+You are an elite B2B Sales Development Representative (SDR) qualifying leads for SiteMakerLab, a premium web design and development studio that builds professional websites, landing pages, e-commerce stores, and custom web platforms for businesses.
 
-Your job: determine if the AUTHOR is a BUYER who wants to PAY someone for "${targetContext}" services, AND if the opportunity is still fresh.
+TARGET CLIENTS: Small business owners, founders, and operators in foreign English-speaking markets (US, UK, Canada, Australia) who need a website built, redesigned, or improved. They run restaurants, retail shops, service businesses, e-commerce stores, real estate agencies, consultancies, law firms, clinics, gyms, or any business that needs a strong online presence.
 
-SCORING RUBRIC for intentScore (0-10):
-- 0: Seller, freelancer, promoter, student, or completely irrelevant
-- 1-3: Tangentially related discussion, no buying signal
-- 4-5: Mentions the topic but unclear if they need to hire someone
-- 6-7: Shows clear need/pain point, likely needs help
-- 8-9: Explicitly asking for help, mentions budget/timeline/hiring
-- 10: Direct "hiring now" or "need someone ASAP" with urgency
+Analyze the provided JSON payload of a prospect. Score the lead from 1 to 10 based ONLY on their likelihood to hire a web studio to build or redesign their website.
 
-SCORING RUBRIC for founderScore (0-10):
-This measures how likely the author is a DECISION-MAKER who can actually sign a contract.
-- 0: Anonymous, no identity signals, bot
-- 1-3: Individual with unclear role, random person
-- 4-6: Appears to be a professional, team lead, or manager
-- 7-9: Likely a founder, CTO, CEO, or VP-level decision-maker
-- 10: Verified founder/CEO with company name explicitly mentioned
+TONE & STYLE RULES FOR SUGGESTED ICEBREAKER (private DM/message):
+1. Write exactly like a real person sending a cold DM, not a salesperson.
+2. Use all lowercase. Do not capitalize the first letter of sentences.
+3. Be conversational and specific to their post. Never be generic. 2 to 3 sentences max.
+4. Reference their exact pain point or business situation from the post.
+5. FORBIDDEN AI WORDS: Never use "seamless", "robust", "delve", "navigate", "supercharge", "streamline", "tapestry", "vital", "crucial", "game changer", "tackle", "dive".
+6. NO DASHES ALLOWED: Never use hyphens (-), en-dashes (–), or em-dashes (—). Use a comma or period instead.
+7. No hashtags. No emojis. No markdown. No quotes around the reply.
+8. NEVER hard pitch. NEVER say "dm me", "i can help", "happy to chat", or "check out my portfolio".
+9. PLATFORM AWARENESS — adjust tone based on the platform field:
+   - X/Twitter DM: Very casual, short, like texting a stranger. 1-2 sentences.
+   - LinkedIn DM: Slightly more professional. Mention you saw their post. 2-3 sentences.
+   - Reddit DM: Community-first. Reference the subreddit or their specific post. Very low pressure. 2-3 sentences.
 
-TIME DECAY RULE (CRITICAL):
-- Posted < 6 hours ago: No penalty. Score normally.
-- Posted 6-24 hours ago: Reduce intentScore by 1 point.
-- Posted 1-3 days ago: Reduce intentScore by 2 points.
-- Posted 3-7 days ago: Reduce intentScore by 3 points.
-- Posted 7+ days ago: Maximum intentScore is 3. The opportunity is likely gone.
-- Apply time decay AFTER calculating the raw intent score. Final score cannot go below 0.
-- Time decay does NOT affect founderScore (a founder is still a founder).
+CRITICAL CONTEXT & AWARENESS RULES:
+1. READ THE BIO: Accurately identify their actual business type from their bio/title. NEVER hallucinate their industry.
+2. WEB-SPECIFIC PAIN SIGNALS: Watch for: "our website is outdated", "we have no website", "lost customers because of our site", "squarespace isn't working", "wix is terrible", "need a new website", "site looks unprofessional", "low conversions", "website not showing on google", "need a landing page", "our online store is broken", "can't update the website".
+3. CELEBRATORY POSTS: If a post is celebratory (grand opening, business launch, anniversary), DO NOT dig for pain. Send a warm congratulatory message (e.g., "congrats on the launch! opening a new location is no joke. hope the first week crushes it").
 
-AUTOMATIC ZERO (intentScore=0, is_buyer=false):
-- Author is SELLING their services (freelancer, agency, "I build X", "I help companies with X")
-- Author is promoting content (blog, newsletter, course, tutorial, thread)
-- Author is a student sharing learning progress
-- Author is sharing news, opinions, or memes — not seeking help
-- Author is giving advice, writing thought leadership, or using hypothetical examples about hiring (e.g. "When I need to hire a developer...") — they are NOT actually hiring right now.
-- Author is BUILDING IT THEMSELVES (Solo Creator Bias, DIY). If they are celebrating not needing a dev team or CTO, or building their own SaaS, they are NOT a buyer.
-- Author is asking for FEEDBACK or a ROAST on their project. They want free opinions, not to pay someone for services. (No Transfer of Value: Money for Work).
+EVALUATION CRITERIA:
+1. Buying Power (0-4 points):
+   - 4 = Business owner, founder, CEO, or operator of a real operating business with customers and revenue.
+   - 3 = Director, manager, or decision-maker at an SMB or growing company.
+   - 2 = Self-employed professional (realtor, consultant, therapist, contractor) who controls their own budget.
+   - 1 = Early-stage solo entrepreneur with unclear revenue.
+   - 0 = Student, job seeker, hobbyist, "indie hacker" with no business, or a direct competitor (web agency, freelance developer).
 
-EXAMPLES:
-Post (1 hour ago): "We need a Node.js developer for our fintech startup. DM me"
-→ {"analysis":"Startup founder hiring a dev, direct buying signal. Very fresh.","is_buyer":true,"intentScore":9,"founderScore":8}
+2. Pain Awareness (0-3 points):
+   - 3 = Explicitly complaining about their website, online presence, lack of a site, poor conversions, or web platform issues.
+   - 2 = Mentions needing a website, wanting to go online, or frustrated with their current DIY site (Wix, Squarespace, etc.).
+   - 1 = Hints at digital presence problems or mentions "need more customers online" without being explicit.
+   - 0 = No website-related pain mentioned. General business content, motivational posts, or unrelated topics.
 
-Post (5 days ago): "Looking for someone to build my MVP"
-→ {"analysis":"Buyer seeking an MVP builder, but posted 5 days ago — reducing score.","is_buyer":true,"intentScore":4,"founderScore":6}
+3. Actionability (0-3 points):
+   - 3 = Actively asking for recommendations, looking to hire NOW, expressed urgency ("launching next month", "need this done asap").
+   - 2 = Clearly exploring options or comparing solutions.
+   - 1 = Discussing the problem but hasn't started actively looking for solutions.
+   - 0 = Passive observation, thought leadership, or hypothetical musings.
 
-Post: "When I need to find a technical co-founder, I always check their GitHub. Here is a thread on how to hire a developer 🧵"
-→ {"analysis":"Thought leadership / advice post using hypothetical hiring phrases. Not actively hiring.","is_buyer":false,"intentScore":0,"founderScore":7}
-
-Post: "You don't need a massive dev team or CTO anymore. As a solo creator, I just built my MVP using Cursor and Nextjs in a weekend."
-→ {"analysis":"Solo creator celebrating building it themselves. Actively avoiding hiring.","is_buyer":false,"intentScore":0,"founderScore":8}
-
-Post: "Just shipped v1 of my app! Seeking a public roast of my landing page. Let me know what you think!"
-→ {"analysis":"Builder sharing a project for free feedback/roasts, not looking to hire a developer.","is_buyer":false,"intentScore":0,"founderScore":5}
-
-Post: "I'm a full-stack developer available for freelance work"
-→ {"analysis":"Freelancer selling services, not a buyer.","is_buyer":false,"intentScore":0,"founderScore":0}
-
-Post: "Just learned how to deploy on AWS!"
-→ {"analysis":"Student sharing learning progress.","is_buyer":false,"intentScore":0,"founderScore":0}
-
-Respond with ONLY valid JSON. No markdown, no explanation.
-{"analysis":"string","is_buyer":boolean,"intentScore":number,"founderScore":number}
+AUTOMATIC ZERO (total_score=1):
+- Author is a web developer, designer, or agency SELLING their own services.
+- Author is promoting content (blog, newsletter, course, tutorial, thread).
+- Author is a student sharing learning progress.
+- Author is BUILDING their own website themselves (DIY). If using no-code tools themselves, they are NOT a buyer.
+- Author is asking for FEEDBACK or a ROAST on their website/project.
+- Author IS a direct competitor (another web studio, freelance developer, web designer).
+- Post is about general tech, coding, or software with no clear business website need.
 `;
 
-async function gradeLeadWithGPT(content: string, author: string, searchContext: string, postedAt: string | null) {
-    try {
-        const postAge = getPostAge(postedAt);
+interface RawLead {
+    platform: string;
+    platformPostId: string;
+    authorHandle: string;
+    content: string;
+    url: string;
+    searchContext?: string;
+    postedAt?: string | null;
+    bio?: string;
+    followerCount?: string;
+    recentTweets?: string[];
+}
 
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            temperature: 0.2,
-            response_format: { type: "json_object" },
-            messages: [
-                {
-                    role: "system",
-                    content: getSystemPrompt(searchContext),
-                },
-                {
-                    role: "user",
-                    content: `This post was found by searching X.com for "${searchContext}".\nPost age: ${postAge}\n\nAuthor: ${author}\nPost: ${content}`,
-                },
-            ],
-        });
+interface GradingResult {
+    totalScore: number;
+    buyingPowerScore: number;
+    painAwarenessScore: number;
+    actionabilityScore: number;
+    qualificationReason: string;
+    suggestedIcebreaker: string;
+    isBuyer: boolean;
+}
 
-        const raw = completion.choices[0]?.message?.content || "{}";
-        const parsed = JSON.parse(raw);
+function buildUserPayload(lead: RawLead): string {
+    const payload: Record<string, any> = {
+        platform: lead.platform,
+        author_handle: lead.authorHandle,
+        search_context: lead.searchContext || "web design",
+        triggering_post: lead.content,
+    };
 
-        const isBuyer = !!parsed.is_buyer;
-        const intentScore = isBuyer ? Math.min(10, Math.max(0, Number(parsed.intentScore) || 0)) : 0;
-        const founderScore = Math.min(10, Math.max(0, Number(parsed.founderScore) || 0));
-
-        return {
-            analysis: parsed.analysis || "",
-            isBuyer,
-            intentScore,
-            founderScore,
-        };
-    } catch (error: any) {
-        console.error("❌ GPT-4o-mini Inference Failed:", error?.message || error);
-        return { analysis: "Error during analysis", isBuyer: false, intentScore: 0, founderScore: 0 };
+    if (lead.bio) payload.bio = lead.bio;
+    if (lead.followerCount) payload.follower_count = lead.followerCount;
+    if (lead.recentTweets && lead.recentTweets.length > 0) {
+        payload.recent_tweets = lead.recentTweets;
     }
+
+    return JSON.stringify(payload, null, 2);
+}
+
+// ─── Fix #1 + Fix #3: Structured Outputs + Throw-on-Failure ─────────────────
+async function gradeLeadWithGPT(lead: RawLead): Promise<GradingResult> {
+    const userPayload = buildUserPayload(lead);
+
+    // Fix #1: openai.chat.completions.parse() guarantees type-safe JSON via Zod
+    const completion = await openai.chat.completions.parse({
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+        temperature: 0.15,
+        response_format: zodResponseFormat(SDRGradingSchema, "sdr_grading"),
+        messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: userPayload },
+        ],
+    });
+
+    const parsed: SDRGrading | null = completion.choices[0]?.message?.parsed ?? null;
+
+    if (!parsed) {
+        const refusal = completion.choices[0]?.message?.refusal;
+        throw new Error(refusal || "AI returned empty structured output");
+    }
+
+    // --- POST-PROCESSING SAFETY NET FOR THE ICEBREAKER ---
+    let icebreaker = parsed.suggested_icebreaker;
+    // 1. Strip all quotes
+    icebreaker = icebreaker.replace(/^["']|["']$/g, "");
+    // 2. Physically remove all hyphens/dashes and replace with a space
+    icebreaker = icebreaker.replace(/[-—–]/g, " ");
+    // 3. Force lowercase to kill robotic capitalization
+    icebreaker = icebreaker.toLowerCase();
+
+    return {
+        totalScore: parsed.total_score,
+        buyingPowerScore: parsed.buying_power_score,
+        painAwarenessScore: parsed.pain_awareness_score,
+        actionabilityScore: parsed.actionability_score,
+        qualificationReason: parsed.qualification_reason,
+        suggestedIcebreaker: icebreaker,
+        isBuyer: parsed.total_score >= 5,
+    };
+}
+
+// ─── Fix #3: Retry helpers ──────────────────────────────────────────────────
+async function getRetryCount(platformPostId: string): Promise<number> {
+    const count = await redis.get(`${RETRY_KEY_PREFIX}${platformPostId}`);
+    return count ? parseInt(count, 10) : 0;
+}
+
+async function incrementRetryCount(platformPostId: string): Promise<number> {
+    const key = `${RETRY_KEY_PREFIX}${platformPostId}`;
+    const newCount = await redis.incr(key);
+    await redis.expire(key, 60 * 60 * 24); // Expire retry counter after 24h
+    return newCount;
+}
+
+async function clearRetryCount(platformPostId: string): Promise<void> {
+    await redis.del(`${RETRY_KEY_PREFIX}${platformPostId}`);
 }
 
 async function startWorker() {
-    console.log("🧠 Intent Worker started (GPT-4o-mini). Listening for leads...");
+    console.log("🧠 Intent Worker V2 started (SDR + Structured Outputs). Listening...");
 
     while (true) {
         try {
             const result = await redis.brpop(QUEUE_NAME, 0);
 
             if (result) {
-                const rawLead = JSON.parse(result[1]);
+                const rawLead: RawLead = JSON.parse(result[1]);
                 const searchContext = rawLead.searchContext || "software development";
-                const postedAt = rawLead.postedAt || null;
-                console.log(`\n📥 Processing post from ${rawLead.authorHandle} [context: ${searchContext}]...`);
+                console.log(`\n📥 Processing: ${rawLead.authorHandle} [context: ${searchContext}]`);
 
-                const aiGrading = await gradeLeadWithGPT(
-                    rawLead.content,
-                    rawLead.authorHandle,
-                    searchContext,
-                    postedAt
-                );
-                console.log(`📊 Graded: ${aiGrading.isBuyer ? 'BUYER ✅' : 'REJECT ❌'} | Intent ${aiGrading.intentScore}/10 | Founder ${aiGrading.founderScore}/10`);
-                console.log(`📝 Analysis: ${aiGrading.analysis}`);
+                if (rawLead.bio) console.log(`   📄 Bio: ${rawLead.bio.substring(0, 60)}...`);
+                if (rawLead.followerCount) console.log(`   👥 Followers: ${rawLead.followerCount}`);
 
-                const savedLead = await prisma.lead.upsert({
-                    where: { platformPostId: rawLead.platformPostId },
-                    update: {
-                        intentScore: aiGrading.intentScore,
-                        founderScore: aiGrading.founderScore,
-                        analysis: aiGrading.analysis,
-                        isBuyer: aiGrading.isBuyer,
-                        searchContext,
-                        postedAt: postedAt ? new Date(postedAt) : undefined,
-                    },
-                    create: {
-                        platform: rawLead.platform,
-                        platformPostId: rawLead.platformPostId,
-                        authorHandle: rawLead.authorHandle,
-                        content: rawLead.content,
-                        url: rawLead.url,
-                        intentScore: aiGrading.intentScore,
-                        founderScore: aiGrading.founderScore,
-                        analysis: aiGrading.analysis,
-                        isBuyer: aiGrading.isBuyer,
-                        searchContext,
-                        postedAt: postedAt ? new Date(postedAt) : undefined,
-                        status: "detected"
-                    },
-                });
+                try {
+                    const grading = await gradeLeadWithGPT(rawLead);
 
-                console.log(`✅ ${savedLead.id ? 'Synced' : 'Processed'} Lead: ${rawLead.authorHandle}`);
+                    console.log(`📊 Score: ${grading.totalScore}/10 | BP:${grading.buyingPowerScore} PA:${grading.painAwarenessScore} AC:${grading.actionabilityScore} | ${grading.isBuyer ? '✅ QUALIFIED' : '❌ UNQUALIFIED'}`);
+                    console.log(`📝 ${grading.qualificationReason}`);
+                    if (grading.isBuyer) console.log(`💬 Icebreaker: ${grading.suggestedIcebreaker}`);
+
+                    // Fix #2: intentScore = totalScore, founderScore = buyingPowerScore (backward compat for frontend)
+                    const savedLead = await prisma.lead.upsert({
+                        where: { platformPostId: rawLead.platformPostId },
+                        update: {
+                            intentScore: grading.totalScore,
+                            founderScore: grading.buyingPowerScore, // backward compat
+                            buyingPowerScore: grading.buyingPowerScore,
+                            painAwarenessScore: grading.painAwarenessScore,
+                            actionabilityScore: grading.actionabilityScore,
+                            analysis: grading.qualificationReason,
+                            suggestedIcebreaker: grading.suggestedIcebreaker,
+                            isBuyer: grading.isBuyer,
+                            bio: rawLead.bio || null,
+                            followerCount: rawLead.followerCount || null,
+                            recentTweets: rawLead.recentTweets || [],
+                            searchContext,
+                            postedAt: rawLead.postedAt ? new Date(rawLead.postedAt) : undefined,
+                        },
+                        create: {
+                            platform: rawLead.platform,
+                            platformPostId: rawLead.platformPostId,
+                            authorHandle: rawLead.authorHandle,
+                            content: rawLead.content,
+                            url: rawLead.url,
+                            bio: rawLead.bio || null,
+                            followerCount: rawLead.followerCount || null,
+                            recentTweets: rawLead.recentTweets || [],
+                            intentScore: grading.totalScore,
+                            founderScore: grading.buyingPowerScore, // backward compat
+                            buyingPowerScore: grading.buyingPowerScore,
+                            painAwarenessScore: grading.painAwarenessScore,
+                            actionabilityScore: grading.actionabilityScore,
+                            analysis: grading.qualificationReason,
+                            suggestedIcebreaker: grading.suggestedIcebreaker,
+                            isBuyer: grading.isBuyer,
+                            searchContext,
+                            postedAt: rawLead.postedAt ? new Date(rawLead.postedAt) : undefined,
+                            status: "detected",
+                        },
+                    });
+
+                    await clearRetryCount(rawLead.platformPostId);
+                    console.log(`✅ Synced Lead: ${rawLead.authorHandle} (${savedLead.id})`);
+
+                } catch (gradingError: any) {
+                    // ─── Fix #3: On failure, re-queue lead instead of inserting fake score ─
+                    const retryCount = await incrementRetryCount(rawLead.platformPostId);
+
+                    if (retryCount <= MAX_RETRIES) {
+                        console.error(`⚠️ GPT failed for ${rawLead.authorHandle} (attempt ${retryCount}/${MAX_RETRIES}): ${gradingError?.message}`);
+                        console.log(`   🔄 Re-queuing lead for retry...`);
+                        await redis.lpush(QUEUE_NAME, JSON.stringify(rawLead));
+                        await new Promise((resolve) => setTimeout(resolve, 2000 * retryCount));
+                    } else {
+                        console.error(`❌ PERMANENTLY FAILED after ${MAX_RETRIES} retries: ${rawLead.authorHandle} — ${gradingError?.message}`);
+                        console.log(`   🗑️ Dropping lead to prevent infinite loop.`);
+                        await clearRetryCount(rawLead.platformPostId);
+                    }
+                }
             }
         } catch (error: any) {
             console.error("Worker Error:", error?.message || "Unknown error");

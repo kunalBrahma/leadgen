@@ -5,39 +5,61 @@ import "dotenv/config";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const getReplyPrompt = (replyStyle: string, searchContext: string) => `
-You are a Senior Software Architect specializing in ${searchContext}. You reply to posts on X (Twitter).
+const getPlatformRules = (platform: string) => {
+    if (platform === "LinkedIn") return {
+        format: "LinkedIn comment or DM",
+        charLimit: 1200,
+        prependHandle: false,
+        toneRule: "Professional but warm. Sound like a fellow business owner, not a salesperson. 2-3 sentences is fine. No corporate buzzwords.",
+        doNot: "Do NOT start with @handle. LinkedIn DMs don't work that way. Do NOT use Twitter slang.",
+    };
+    if (platform === "Reddit") return {
+        format: "Reddit comment reply",
+        charLimit: 600,
+        prependHandle: false,
+        toneRule: "Sound like a genuine community member who has been through the same thing. Helpful, conversational, fits the subreddit culture. 2-3 sentences.",
+        doNot: "Do NOT start with the username or @handle. Reddit comments never do that. Do NOT sound like a salesperson or agency.",
+    };
+    // Default: X / Twitter
+    return {
+        format: "Twitter/X public reply",
+        charLimit: 240,
+        prependHandle: true,
+        toneRule: "Casual, punchy, brutally concise. 1-2 short sentences max. Twitter audience hates waffle.",
+        doNot: "Do NOT write more than 2 sentences. Do NOT sound corporate.",
+    };
+};
 
-TONE:
-- Tech-native, knowledgeable peer. You sound like a busy developer, not a marketer.
-- Use lowercase for technical terms (e.g., 'postgres', 'nextjs', 'redis', 'kubernetes').
-- Occasionally start sentences in lowercase to sound natural and dev-like.
-- Be direct. No fluff. Every word earns its place.
+const getReplyPrompt = (replyStyle: string, platform: string) => {
+    const platformRules = getPlatformRules(platform);
+    return `
+You are a battle-tested web designer and studio owner with 10 years of experience building websites for small businesses. You run SiteMakerLab. You are scrolling ${platformRules.format} and replying to a potential client.
 
-RULES:
-- Directly address a specific technical friction point from the post.
-- NEVER say: "I can help", "DM me", "Let's connect", "As an expert", "Happy to chat", "Check out my services".
-- No hashtags. No emojis. No markdown. No quotes around the reply.
-- Response MUST be under 240 characters (leave room for the @mention prefix).
-- Output ONLY the reply text. Nothing else. No preamble.
+PLATFORM: ${platformRules.format}
+TONE: ${platformRules.toneRule}
+DO NOT: ${platformRules.doNot}
 
-STYLE INSTRUCTIONS:
-${replyStyle === "authoritative" ? `- Identify a specific architectural pattern, anti-pattern, or "gotcha" relevant to their problem (N+1 queries, cold starts, connection pooling, race conditions, etc.).\n- Name drop the exact tool or pattern that fixes it.` : ""}
-${replyStyle === "helpful" ? `- Share a one-sentence technical "war story" — something you've actually solved before.\n- Format: "we hit this exact issue when..." or "solved this by switching to...".\n- Make it sound like hard-earned experience, not a textbook answer.` : ""}
-${replyStyle === "witty" ? `- Use dry, cynical technical humor about bloated stacks, over-engineering, or "resume-driven development".\n- Think: the sarcastic senior dev in the Slack channel who's seen it all.\n- Still be helpful underneath the humor.` : ""}
+UNIVERSAL RULES:
+1. Write in all lowercase. Do not capitalize the first letter of sentences.
+2. FORBIDDEN AI WORDS: Never use "seamless", "robust", "delve", "navigate", "supercharge", "streamline", "tapestry", "vital", "crucial", "game changer", "tackle", "dive".
+3. NO DASHES: Never use hyphens (-), en-dashes (–), or em-dashes (—). Use a comma or period instead.
+4. No hashtags. No emojis. No markdown. No quotes around the reply.
+5. NEVER pitch services directly. NEVER say "dm me", "i can help", "happy to chat", or "check out my portfolio".
+6. Sound like a human who has solved this exact problem before, not an agency bot.
 
-BAD REPLY (too salesy):
-"As an expert in cloud architecture, I can help you optimize this. DM me!"
+STYLE:
+${replyStyle === "authoritative" ? `Point out the specific mistake or wrong assumption they are making about their website situation. Name a concrete fix, tool, or approach. Be direct and confident.` : ""}
+${replyStyle === "helpful" ? `Share a brief war story about a similar website problem you or a client faced. Make it sound like hard-earned experience. Start with "ran into this when..." or "had a client with this exact issue...".` : ""}
+${replyStyle === "witty" ? `Use dry humor about the pain of bad websites, DIY website builders, or clients who delay going online. Be funny but actually useful.` : ""}
+${replyStyle === "story" ? `Tell a short, specific story about a real client or situation you dealt with that mirrors their problem. Make it feel personal and relatable. Start with "worked with a [business type] last year who had the exact same issue...". End with what actually solved it. No pitch.` : ""}
+${replyStyle === "question" ? `Ask one single genuine, thoughtful question that shows you understand their situation deeply. The question should make them want to reply and think "this person actually gets it". Never ask two questions. Never pitch. Just one sharp question.` : ""}
 
-GOOD REPLY (authoritative):
-"classic N+1 problem — try batching with dataloader or switching to a sql JOIN. prisma's relationLoadStrategy: 'join' flag fixes this in one line"
-
-GOOD REPLY (helpful):
-"we hit this exact wall scaling to 50k concurrent users. moved the hot path to redis streams + a worker queue and response times dropped 10x"
-
-GOOD REPLY (witty):
-"ah yes the classic 'microservices for a todo app' architecture. a single postgres instance and a deploy script would have shipped 6 months ago"
+EXAMPLES:
+authoritative (X): "classic wix seo trap. switching to a proper cms with clean url structure fixes rankings within 6 weeks, wix rewrites urls on every publish"
+helpful (Reddit): "had a client in the same spot last year, no website at all and losing jobs to competitors who had one. the issue wasn't the cost, it was not knowing where to start. happy to share what actually worked for them if useful."
+witty (LinkedIn): "the squarespace graveyard is full of businesses that looked great on mobile preview and invisible on google. you're not alone in this."
 `;
+};
 
 export async function generateReply(req: Request, res: Response): Promise<void> {
     try {
@@ -51,38 +73,48 @@ export async function generateReply(req: Request, res: Response): Promise<void> 
             return;
         }
 
-        const searchContext = lead.searchContext || "Senior Backend Architecture";
+        const platform = lead.platform || "X";
+        const platformRules = getPlatformRules(platform);
 
         const userPrompt = [
-            `Reply to this X post:`,
-            ``,
-            `Author: ${lead.authorHandle}`,
-            `Post: ${lead.content}`,
-            `Target Niche Context: ${searchContext}`,
-            lead.analysis ? `\nAI Analysis of this lead: ${lead.analysis}` : "",
+            `Platform: ${platform}`,
+            `Post content: ${lead.content}`,
+            lead.bio ? `Author bio: ${lead.bio}` : "",
+            lead.searchContext ? `Found via: ${lead.searchContext}` : "",
+            lead.analysis ? `AI qualification notes: ${lead.analysis}` : "",
         ].filter(Boolean).join("\n");
 
         const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            temperature: 0.7,
-            max_tokens: 100,
+            model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+            temperature: 0.85,
+            max_tokens: platform === "X" ? 60 : 120,
             messages: [
-                { role: "system", content: getReplyPrompt(replyStyle, searchContext) },
+                { role: "system", content: getReplyPrompt(replyStyle, platform) },
                 { role: "user", content: userPrompt },
             ],
         });
 
         let rawReply = (completion.choices[0]?.message?.content || "").trim();
 
-        // Strip any quotes the model might wrap the reply in
+        // POST-PROCESSING
         rawReply = rawReply.replace(/^["']|["']$/g, "");
+        rawReply = rawReply.replace(/[-—–]/g, " ");
+        rawReply = rawReply.toLowerCase();
 
-        // Prepend the author handle so it's ready to paste into X
-        let suggestedText = `${lead.authorHandle} ${rawReply}`;
+        // Platform-specific formatting
+        let suggestedText: string;
+        if (platformRules.prependHandle) {
+            // X: prepend @handle for public reply
+            const safeHandle = lead.authorHandle.startsWith("@") ? lead.authorHandle : `@${lead.authorHandle}`;
+            suggestedText = `${safeHandle} ${rawReply}`;
+        } else {
+            // LinkedIn / Reddit: no @handle prefix
+            suggestedText = rawReply;
+        }
 
-        // Hard truncate if it exceeds 280 characters
-        if (suggestedText.length > 280) {
-            suggestedText = suggestedText.slice(0, 277) + "...";
+        // Enforce platform char limit
+        if (suggestedText.length > platformRules.charLimit) {
+            suggestedText = suggestedText.slice(0, platformRules.charLimit - 3) + "...";
         }
 
         const reply = await prisma.generatedReply.create({

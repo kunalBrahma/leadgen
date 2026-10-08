@@ -16,21 +16,28 @@ model User {
 }
 
 model Lead {
-  id             String           @id @default(uuid())
-  platform       String
-  platformPostId String           @unique
-  authorHandle   String
-  content        String
-  url            String
-  intentScore    Int?
-  founderScore   Int?
-  analysis       String?
-  isBuyer        Boolean?         @default(false)
-  searchContext  String?
-  postedAt       DateTime?
-  status         String           @default("detected")
-  createdAt      DateTime         @default(now())
-  generatedReply GeneratedReply[]
+  id                  String           @id @default(uuid())
+  platform            String
+  platformPostId      String           @unique
+  authorHandle        String
+  content             String
+  url                 String
+  bio                 String?
+  followerCount       String?
+  recentTweets        Json?
+  intentScore         Int?
+  founderScore        Int?
+  buyingPowerScore    Int?
+  painAwarenessScore  Int?
+  actionabilityScore  Int?
+  analysis            String?
+  suggestedIcebreaker String?
+  isBuyer             Boolean?         @default(false)
+  searchContext       String?
+  postedAt            DateTime?
+  status              String           @default("detected")
+  createdAt           DateTime         @default(now())
+  generatedReply      GeneratedReply[]
 }
 
 model IntentConfig {

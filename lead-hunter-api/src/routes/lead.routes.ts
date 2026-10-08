@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createLead, deleteLead, getAllLeads, getLeadById, updateLead, getLeadStats, deleteAllLeads } from "../controllers/lead.controller";
+import { createLead, deleteLead, getAllLeads, getLeadById, updateLead, getLeadStats, deleteAllLeads, updateLeadStatus } from "../controllers/lead.controller";
 import { generateReply } from "../controllers/reply.controller";
 
 const router = Router();
@@ -16,6 +16,7 @@ router.delete("/", deleteAllLeads);
 
 router.get("/:id", getLeadById);
 router.put("/:id", updateLead);
+router.patch("/:id/status", updateLeadStatus);
 router.delete("/:id", deleteLead);
 
 export default router;

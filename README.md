@@ -1,107 +1,235 @@
-# 🎯 AI Lead Generation Agent
+# Lead Hunter — AI-Powered Foreign Client Acquisition for SiteMakerLab
 
-An autonomous system that scrapes social platforms (X/Twitter), leverages GPT-4 to score leads based on actual buying intent, and generates personalized, high-converting outreach messages.
+Lead Hunter is an autonomous lead generation system built for **SiteMakerLab** to find and engage foreign web design clients (US, UK, Canada, Australia) across Reddit, LinkedIn, and X (Twitter).
 
-## 🏗️ Architecture
+It scrapes three platforms, grades every lead with GPT-4o using a custom scoring matrix tuned for web design buyers, and generates platform-native outreach — public Reddit comments, tweet replies, or LinkedIn DMs — all from a single dashboard.
 
-The system is split into multiple specialized microservices:
+---
 
-1. **Frontend Dashboard (Next.js)**
-   - Query builder to add target search terms.
-   - Real-time stats (Total Leads, Hot Leads, Avg Intent).
-   - Live Feed of scraped leads, sorted and grouped by search context.
-   - UI to generate tailored AI replies.
+## How It Works
 
-2. **Backend API (Node.js/Express + Prisma)**
-   - Manages CRUD operations for Leads, Queries, and AI Replies.
-   - Stores data securely in PostgreSQL.
-   - Triggers the scraper and manages rate limiting.
+```
+Scraper (Reddit / X / LinkedIn)
+    ↓ pushes raw lead JSON
+Redis Queue (port 6380)
+    ↓ brpop
+Intent Worker (GPT-4o grading)
+    ↓ upsert with scores + icebreaker
+PostgreSQL (Prisma)
+    ↓ REST API
+Next.js Dashboard
+    ↓
+Copy comment / reply / DM → Send
+```
 
-3. **Data Pipeline & Workers**
-   - **X Scraper (`x_worker.py`):** Uses Playwright to navigate X, execute searches, and scrape posts. It implements a "Dumb Filter" to auto-reject obvious false positives (e.g., #buildinpublic, solo builders). Raw leads are pushed to a Redis queue.
-   - **Intent Scorer (`intentWorker.ts`):** Pulls raw leads from Redis and sends them to GPT-4o-mini. The AI uses strict rubrics to assign an `intentScore` (buying intent) and a `founderScore` (decision-maker likelihood).
+---
 
-## ✨ Key Features
+## Scoring System
 
-- **The "Builder Trap" Filter:** Python-layer filter drops tweets from solo creators promoting their own SaaS or asking for feedback, saving AI credits.
-- **Time-Decay Scoring:** The AI dynamically penalizes the intent score of older posts (because a post from 7 days ago means they probably already found someone).
-- **"Transfer of Value" AI Rule:** The AI explicitly looks for buying signals (someone looking to pay money for work) rather than just syntactic matches.
-- **Architect Persona Replies:** Generates high-converting, non-salesy outreach messages using a "Senior Software Architect" persona. Choose between *Helpful*, *Authoritative*, or *Witty* tones.
-- **Deduplication:** Redis sets ensure the same tweet is never scraped or sent to the AI twice.
+Every lead is graded on three axes via GPT-4o Structured Outputs (Zod schema):
 
-## 🚀 Getting Started
+| Axis | Max | What it measures |
+|---|---|---|
+| Buying Power | 4 | Are they a business owner who controls budget? |
+| Pain Awareness | 3 | Are they explicitly complaining about their website? |
+| Actionability | 3 | Are they ready to act now? |
+| **Intent Score** | **10** | Overall buyer qualification |
+
+- `intentScore >= 5` → **Verified Buyer** (shown in feed)
+- `intentScore >= 7` → **Hot Lead** (highlighted)
+- `intentScore >= 9` → **Extreme Intent** (filter available)
+
+### Automatic disqualification (score = 1)
+- Web developers, designers, agencies selling their own services
+- Students, job seekers, DIY builders
+- "Build in public" / indie hackers with no business
+- Competitors
+
+---
+
+## Platform Strategy
+
+### Reddit (Best Quality)
+- Targets `r/smallbusiness`, `r/entrepreneur`, `r/startups`, `r/webdesign`, `r/Wordpress` by default
+- Subreddits are configurable from the Settings page — no code changes needed
+- Uses Reddit's JSON API (no Playwright, no login, no rate limit issues)
+- Generates **public comment replies** — not DMs
+- Reply styles: Share Story / Helpful Advice / Ask a Question
+- Dedup: Redis cache + PostgreSQL fallback (survives Redis restarts)
+
+### LinkedIn (Professional)
+- Scrapes content search filtered to US, UK, Canada, Australia, NZ, Ireland via geoUrn
+- Uses saved cookies from `linkedin_auth.py`
+- Generates professional **LinkedIn DMs**
+- Reply styles: Helpful / Share Story / Authoritative
+
+### X / Twitter (Supplementary)
+- Filters with `lang:en` to target English-speaking markets
+- Generates short punchy **tweet replies** (≤240 chars)
+- Reply styles: Call It Out / Witty / Helpful
+- Note: X DMs require mutual follow or open DM settings
+
+---
+
+## Tech Stack
+
+**Backend**
+- Node.js + Express + TypeScript
+- Prisma ORM → PostgreSQL
+- Redis (queue)
+- OpenAI SDK (GPT-4o-mini — grading + replies)
+- Zod (Structured Outputs)
+- Socket.io (WebSockets)
+
+**Scrapers**
+- Python 3.10+
+- `reddit_worker.py` — requests + Reddit JSON API
+- `x_worker.py` — Playwright (headless browser)
+- `linkedin_worker.py` — Playwright + cookie auth
+
+**Frontend**
+- Next.js (App Router)
+- Tailwind CSS + Shadcn UI
+- Tabler Icons
+
+---
+
+## Setup
 
 ### Prerequisites
-- Node.js & Bun
-- Python 3.x
-- PostgreSQL
-- Redis Server
-- OpenAI API Key
+- Node.js v18+
+- Python 3.10+
+- PostgreSQL on port 5433
+- Redis on port 6380
+- OpenAI API key
 
-### Installation
+### 1. Install dependencies
 
-1. **Clone the repository and install dependencies:**
-    ```bash
-    # Install backend dependencies
-    cd lead-hunter-api
-    bun install
-    pip install playwright redis python-dotenv requests
-    playwright install chromium
-
-    # Install frontend dependencies
-    cd ../frontend
-    bun install
-    ```
-
-2. **Set up Environment Variables:**
-    Create a `.env` file in `lead-hunter-api`:
-    ```env
-    DATABASE_URL="postgresql://user:password@localhost:5432/lead_hunter"
-    REDIS_URL="redis://localhost:6379"
-    OPENAI_API_KEY="sk-your-openai-key"
-    CORS_ORIGIN="http://localhost:3000"
-    ```
-
-3. **Setup Database:**
-    ```bash
-    cd lead-hunter-api
-    npx prisma db push
-    ```
-
-### Running the App
-
-You need to run several services concurrently. Open multiple terminal tabs:
-
-**Terminal 1: Redis**
 ```bash
-redis-server
+# Backend
+cd lead-hunter-api
+npm install
+
+# Python scraper dependencies
+python3 -m venv venv
+source venv/bin/activate
+pip install playwright redis requests
+playwright install chromium
+
+# Frontend
+cd ../frontend
+npm install
 ```
 
-**Terminal 2: Background AI Worker**
+### 2. Environment variables
+
+**`lead-hunter-api/.env`**
+```env
+DATABASE_URL="postgresql://admin:password@localhost:5433/lead_hunter?schema=public"
+REDIS_URL="redis://localhost:6380"
+OPENAI_API_KEY="sk-your-key"
+OPENAI_MODEL="gpt-4o-mini"
+CORS_ORIGIN="http://localhost:3001"
+PORT=3000
+```
+
+**`frontend/.env.local`**
+```env
+NEXT_PUBLIC_API_URL="http://localhost:3000"
+```
+
+### 3. Database
+
 ```bash
 cd lead-hunter-api
-bun run dev:worker
+npx prisma generate
+npx prisma db push
 ```
 
-**Terminal 3: Backend API**
+### 4. LinkedIn authentication (first time only)
+
 ```bash
 cd lead-hunter-api
-bun dev
+source venv/bin/activate
+python3 linkedin_auth.py
+# Log in manually in the browser that opens — cookies saved automatically
 ```
 
-**Terminal 4: Frontend Dashboard**
+---
+
+## Running the System
+
+Open 4 terminal tabs:
+
 ```bash
-cd frontend
-bun dev
+# Tab 1 — Redis
+redis-server --port 6380
+
+# Tab 2 — Backend API
+cd lead-hunter-api && npm run dev
+
+# Tab 3 — Intent Worker (GPT grader)
+cd lead-hunter-api && npx ts-node src/workers/intentWorker.ts
+
+# Tab 4 — Frontend
+cd frontend && npm run dev -- -p 3001
 ```
 
-Visit `http://localhost:3000` to view the dashboard!
+Dashboard: `http://localhost:3001/dashboard`
 
-## 🧪 Usage
+---
 
-1. Go to the dashboard.
-2. Enter target keywords (e.g., `need a developer`, `building an mvp`).
-3. Click **"Force Scrape"**.
-4. The Python scraper will open a headless browser, scroll X, and push matches to Redis.
-5. Watch the dashboard as the AI processes the queue in real-time, grades the leads, and assigns scores.
-6. Click **"Generate Reply"** on any high-intent lead to get an AI-crafted opening message.
+## Usage
+
+### Scraping
+
+1. Go to **Settings** → add search keywords and configure target subreddits
+2. On the **Dashboard**, type a query, select platform (Reddit / LinkedIn / X), click **Force Scrape**
+3. Watch the Intent Worker terminal — leads are graded in real time
+4. Qualified buyers appear in the Live Feed grouped by platform then by query
+
+### Outreach
+
+Each lead card shows:
+- **Intent Score** (1-10) with buying power / pain / actionability breakdown
+- **AI Analysis** — one-line qualification reason
+- **Suggested Comment / DM** — pre-written, platform-native opener
+- **Generate Comment / Tweet Reply / Reply** — choose a style and generate
+
+**Per platform:**
+- Reddit → copy the suggested comment, post it publicly in the thread
+- X → use "Tweet Reply" to draft a public reply or "Twitter DM" for direct message
+- LinkedIn → copy the DM and send via LinkedIn messaging
+
+### Lead Status Tracking
+
+Each card has a status tracker:
+- **Contacted** — you sent the message
+- **Replied** — they responded
+- **Closed** — you won the client
+
+---
+
+## Settings Page
+
+| Section | What it controls |
+|---|---|
+| Search Keywords | Queries used by X and LinkedIn scrapers |
+| Target Subreddits | Subreddits the Reddit scraper searches (add/remove without touching code) |
+
+---
+
+## API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/leads` | Fetch leads with filters/sort/pagination |
+| GET | `/api/leads/stats` | Total, hot leads, avg score, buyer count |
+| PATCH | `/api/leads/:id/status` | Update lead status (detected/contacted/replied/closed) |
+| DELETE | `/api/leads` | Delete all leads |
+| POST | `/api/scrape` | Trigger scraper (body: `{ queries, platform }`) |
+| GET | `/api/queries` | Get active search keywords |
+| POST | `/api/queries` | Save search keywords |
+| GET | `/api/queries/subreddits` | Get active subreddits |
+| POST | `/api/queries/subreddits` | Save subreddits |
+| POST | `/api/leads/:leadId/generate-reply` | Generate platform-aware reply |

@@ -112,16 +112,16 @@ export async function getAllLeads(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    const validFilterFields = ["platform", "status", "isBuyer", "authorHandle"];
     const where: Prisma.LeadWhereInput = {};
     for (const key in filters) {
-      if (validSortFields.includes(key)) {
+      if (validFilterFields.includes(key)) {
         let value: any = filters[key];
 
         if (value === "true") value = true;
         if (value === "false") value = false;
 
         type WhereKey = keyof Prisma.LeadWhereInput;
-        // The @ts-expect-error comment was removed from here
         where[key as WhereKey] = value;
       }
     }
@@ -203,6 +203,26 @@ export async function updateLead(req: Request, res: Response): Promise<void> {
       res.status(400).json({ success: false, errors: formatted.fieldErrors });
       return;
     }
+    if (error instanceof Error) {
+      res.status(500).json({ success: false, message: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+export async function updateLeadStatus(req: Request, res: Response): Promise<void> {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const validStatuses = ["detected", "contacted", "replied", "closed"];
+    if (!validStatuses.includes(status)) {
+      res.status(400).json({ success: false, message: `Invalid status. Allowed: ${validStatuses.join(", ")}` });
+      return;
+    }
+    const lead = await prisma.lead.update({ where: { id }, data: { status } });
+    res.status(200).json({ success: true, data: lead });
+  } catch (error: unknown) {
     if (error instanceof Error) {
       res.status(500).json({ success: false, message: error.message });
       return;
